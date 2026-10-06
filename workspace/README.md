@@ -145,6 +145,48 @@ python3 -m pwncorpus.delta apply delta-v1-v2 mirror --rollback # 回滚到 v1
 - **重复应用幂等**：镜像已是该增量的目标版本时，应用是经核验的空操作，不会破坏任何内容；镜像若已被篡改，则验证失败而不会被"顺手修复"掩盖。
 - 全量导出、在线查询与旧版本验证行为完全不变（验证器逻辑被重构为可复用的函数，校验项与输出保持一致）。
 
+## 来源责任账本（可重放、可离线裁决）
+
+为离线语料仓库提供与主库**完全独立**的追加式来源责任账本（独立 SQLite 文件 + 独立 HMAC 密钥），跨越三个边界：命令行提交 → 追加式持久化哈希链 → 独立审计进程导出时间点快照 → **无数据库连接**的离线工具只凭快照和一条输入摘要作出裁决。现有摄取、发布、全量导出、增量升级命令均不改变。
+
+```bash
+# 初始化账本（生成 ledger.db 与 0600 的 ledger.db.key；密钥带外分发给审计方）
+python3 -m pwncorpus.cli --ledger ledger.db ledger-init
+
+# 注册来源，得到一次性提交令牌（库中只存令牌哈希）
+python3 -m pwncorpus.cli --ledger ledger.db ledger-source --source breach-2026Q3
+
+# 提交来源声明：文件每行一个 40 位 SHA-1 指纹（或 sha256rec:<hex64> 预摘要）
+python3 -m pwncorpus.cli --ledger ledger.db attest-submit \
+    --source breach-2026Q3 --token lgs_... --file leak.txt
+# 声明载荷含：source、batch_id、原始文件 SHA-256、规范化记录集内容哈希、逐条记录摘要
+# （仅存 sha256(40 位指纹)，原始口令与完整指纹永不进账本）
+
+# 撤回（必须给非空理由；只有声明该批次的来源可撤回）与误报纠错
+python3 -m pwncorpus.cli --ledger ledger.db attest-retract --source breach-2026Q3 \
+    --token lgs_... --batch bat_... --reason "court order 2026-09-30"
+python3 -m pwncorpus.cli --ledger ledger.db attest-correct --source breach-2026Q3 \
+    --token lgs_... --batch bat_... --file falsepositives.txt
+
+# 独立审计进程导出某时间点的责任快照（默认当前；--as-of 指定时刻；默认 24h 过期）
+python3 -m pwncorpus.cli --ledger ledger.db ledger-snapshot --out snapshot/ [--as-of ISO8601]
+
+# 完全离线的裁决（没有任何数据库连接；--key 可选，追加真实性校验）
+python3 -m pwncorpus.adjudicate verify snapshot/ [--key ledger.db.key]
+python3 -m pwncorpus.adjudicate record snapshot/ --source breach-2026Q3 \
+    --fingerprint A1B2C3...   # 或 --record-sha256 <hex64>
+```
+
+账本结构与安全性质：
+
+- **追加式签名链**：`ledger_entries` 中每条记录为 `seq / entry_id / prev_sha256 / entry_sha256 / entry_mac / payload / sealed_at`。`entry_sha256 = sha256(规范JSON{seq, prev, entry_id, payload})`，从 genesis（由 ledger_id 派生）起逐条链接；`entry_mac = HMAC-SHA256(key, entry_sha256)`。行从不更新或删除。封链时间戳在账本内**严格单调递增**（同毫秒碰撞自动 +1ms），因此撤回与纠错的先后顺序是全序，快照旧于/晚于撤回的纠错分别标注 `before_retraction` / `after_retraction`（撤回前纠错为 `while_active`）。
+- **两段式持久化与中断续封**：提交先把载荷原子写入 `ledger_pending`（独立事务提交），再逐条以独立写事务封链；进程在封链中途被杀死后，剩余条目仍在暂存区，下一个写入者或独立的 `ledger-seal` 命令**从最后一个链项继续**，链无空洞、不重复。
+- **重复提交返回原记录**：`(source, 规范化内容哈希)` 与显式幂等键双重判重，已封链或仍在暂存区的重复声明都返回原 `batch_id`，链上不新增条目；重复撤回/全冗余纠错同样为空操作。幂等键跨来源复用是明确冲突，绝不会返回他人批次。
+- **离线裁决只凭快照 + 一条输入摘要**：快照目录为 `chain.jsonl`（截断到时间点的完整链，逐行规范 JSON）+ `snapshot.json`（重放链派生出的逐记录责任状态 + head/genesis/chain 绑定 + 自哈希 + HMAC）。`pwncorpus.adjudicate` 模块在结构上**不 import sqlite3**（有测试用阻断导入的独立进程验证）。裁决回答：是否曾由指定来源提交（可多条归属，同名记录不同批次/不同来源分别列出）、何时被撤回、撤回理由、撤回前后是否纠错。
+- **快照自校验顺序**：结构字段 → 过期判定 → 链文件哈希 → 链连续性/prev 链接/(可选)逐条目 MAC → head 绑定 → **从链重放责任状态与快照声明逐字节比对** → 快照自哈希/(可选)快照 MAC。任一项失败给出明确 `FAIL:`；过期退出码 3，其余 1。
+- **明确失败、不泄露桶内容**：链项缺失（跳号/断链）、链或状态被篡改、摘要不符（纠错记录不属于该批次）、来源令牌错误或越权操作他人批次、并行写锁冲突（`BEGIN IMMEDIATE` 忙等耗尽后报 `parallel write conflict`）都有明确错误。所有链级错误信息只引用 seq 与字段名；否定裁决（记录不存在或仅属他人）始终是同一最小形状 `{"submitted": false, ...}`，不能用来探测桶内容；账本数据库内不存在原始口令或完整指纹（有存储内容断言测试）。
+- **快照过期与不可降级**：快照带 `expires_at`，过期后必须重新导出才能裁决；向已有快照目录导出时，较新责任状态（更高 head seq）可刷新较旧快照，**较旧快照任何情况下都不能覆盖较新状态**，同 head 的重复导出是空操作（`--force` 仅用于同级重写）。时间点快照内嵌链被截断到 cutoff，不会泄露该时刻之后的撤回理由。
+
 ## 并发设计
 
 - SQLite WAL + 每请求独立连接；写事务 `BEGIN IMMEDIATE`（带忙等待与重试），读事务为快照隔离。
@@ -168,4 +210,4 @@ python3 -m pwncorpus.delta apply delta-v1-v2 mirror --rollback # 回滚到 v1
 python3 -m unittest discover -s tests -v
 ```
 
-46 个用例覆盖：并发摄取（同批次/不同批次）、批次去重不重复计数、阈值抑制小桶、阈值变更只经新版本、撤回/误报修正只经新版本生效、激活期间查询不混版、旧版本不可查但可离线验证、导出篡改检测、低于阈值桶检测、存储与 API 面均无原始口令、授权作用域、草稿陈旧检测（新增/撤回/纠错均触发）、无操作写入不误判、冲突后刷新保留版本号与阈值、激活与来源写入并发的先后语义、确认与所审草稿的清单绑定，以及增量包：分桶正确性与双清单绑定、独立检查与基线核对、应用结果与目标全量导出逐字节一致、基线不匹配/载荷篡改/清单篡改/内容缺失均拒绝、切换中与写入清单后中断的前向恢复与回滚、回滚恢复被删桶、暂存后未登记日志即掉电的前向继续与回滚清理（不留孤立暂存区、不误报已回滚）、干净镜像回滚如实报告无可回滚、混入不同增量包被拒、重复应用幂等、全部三个 CLI 入口（含库内 delta-generate）。
+76 个用例覆盖：并发摄取（同批次/不同批次）、批次去重不重复计数、阈值抑制小桶、阈值变更只经新版本、撤回/误报修正只经新版本生效、激活期间查询不混版、旧版本不可查但可离线验证、导出篡改检测、低于阈值桶检测、存储与 API 面均无原始口令、授权作用域、草稿陈旧检测（新增/撤回/纠错均触发）、无操作写入不误判、冲突后刷新保留版本号与阈值、激活与来源写入并发的先后语义、确认与所审草稿的清单绑定，以及增量包：分桶正确性与双清单绑定、独立检查与基线核对、应用结果与目标全量导出逐字节一致、基线不匹配/载荷篡改/清单篡改/内容缺失均拒绝、切换中与写入清单后中断的前向恢复与回滚、回滚恢复被删桶、暂存后未登记日志即掉电的前向继续与回滚清理（不留孤立暂存区、不误报已回滚）、干净镜像回滚如实报告无可回滚、混入不同增量包被拒、重复应用幂等、全部三个 CLI 入口（含库内 delta-generate）；以及来源责任账本：声明/撤回/纠错链与逐条目 HMAC、重复提交/撤回/纠错返回原记录、封链中途被杀后从最后链项续封、撤回与纠错的先后排序（撤回前/撤回后/活跃中）、时间点快照截断链与状态、快照过期、链项缺失/状态伪造/载荷篡改/错密钥拒绝、摘要不符、来源令牌错误与越权、并行写入串行成无空洞链且同批次仅一次非重复、旧快照不可覆盖较新状态、否定裁决同形且链级错误不含摘要/来源、账本存储无原始指纹、adjudicate 在阻断 sqlite3 的独立进程中可用、跨命令行/存储/审计/裁决四进程的 CLI 端到端流程。
