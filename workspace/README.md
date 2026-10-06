@@ -162,10 +162,75 @@ python3 -m pwncorpus.delta apply delta-v1-v2 mirror --rollback # 回滚到 v1
 - 建议客户端优先使用 `{"sha1": "..."}` 预哈希提交，原始口令不跨网络。
 - 未实现响应填充（padding）与速率限制；高敏部署可在代理层加 padding 与限流以抵抗流量分析。
 
+## 可重放来源责任账本（provenance ledger）
+
+在摄取流水线之外，另有一个**追加式、签名链化**的来源责任账本，跨越三个独立边界工作：命令行写入、持久化 SQLite、独立审计/离线核验进程。它不改变上面的任何摄取、发布、全量导出与增量升级命令。
+
+### 信任模型与数据结构
+
+- **链项（entry）**：`register / submit / retract / correct` 四类。每项含无间隙 `seq`、来源名、规范化 payload、时间戳、幂等 `claim_id`、来源签名所用公钥、签名与 `prev_hash`；`entry_hash` 对除自身外的全部字段做规范 JSON 哈希，`prev_hash` 指向前一项，第一项指向 `GENESIS:<ledger_id>`。
+- **来源密钥**：来源持 Ed25519 密钥（纯标准库 `pwncorpus/ed25519.py`，RFC 8032）。`register` 把来源名绑定到公钥（自签名）；之后每条声明都用该私钥签名，写入事务内逐条验签，伪造声明永不上链。账本另持有一把 **genesis 密钥**（私钥文件 0600，不入库），用于为快照签名。
+- **责任语义**：`submit` 携带输入文件 SHA-256 与该批贡献的分桶前缀集合（只存哈希/前缀，不存桶内容）；`retract` 以**链序号 + 文件摘要**绑定某次提交并附**必填撤回理由**；`correct` 记录被纠错的指纹。只有提交者本人可撤回/纠错其提交（否则来源权限错误）。撤回与纠错的先后即链上先后，快照明确给出"纠错是否发生在撤回之前"。
+
+### 三个边界
+
+```bash
+export PYTHONPATH=/workspace
+# 边界 1：写入（命令行 -> 追加式 SQLite 签名链）
+python3 -m pwncorpus.cli --db corpus.db ledger-init --key genesis.key
+python3 -m pwncorpus.cli --db corpus.db ledger-keygen --source breach-co --key src.key
+python3 -m pwncorpus.cli --db corpus.db ledger-register --source breach-co --key src.key
+python3 -m pwncorpus.cli --db corpus.db ledger-submit   --source breach-co --key src.key --file leak.txt
+python3 -m pwncorpus.cli --db corpus.db ledger-correct  --source breach-co --key src.key --claim-seq 2 --file falsepos.txt
+python3 -m pwncorpus.cli --db corpus.db ledger-retract  --source breach-co --key src.key --claim-seq 2 --file leak.txt --reason "court order"
+python3 -m pwncorpus.cli --db corpus.db ledger-head
+
+# 边界 2：独立审计进程（只读数据库，整链校验后导出带 TTL 的签名时间点快照）
+python3 -m pwncorpus.audit verify --db corpus.db
+python3 -m pwncorpus.audit export --db corpus.db --key genesis.key --out snap.json --ttl 86400
+python3 -m pwncorpus.audit export --db corpus.db --key genesis.key --out old.json --as-of 2026-09-01T00:00:00+00:00
+
+# 边界 3：无数据库连接的离线核验（仅凭快照 + 输入摘要/指纹）
+python3 -m pwncorpus.attest verify snap.json
+python3 -m pwncorpus.attest check  snap.json --fingerprint <40-hex-sha1> --source breach-co
+python3 -m pwncorpus.attest check  snap.json --fingerprint <40-hex> --source breach-co --file leak.txt
+python3 -m pwncorpus.attest check  snap.json --prefix ABCDE
+```
+
+`attest` 模块**不导入 sqlite3**；把 `corpus.db` 移走后核验照常工作。
+
+### 快照与核验
+
+快照绑定 `ledger_id / genesis_pub / head_seq / head_hash / created_at / not_after / ttl / prefix_len / 全部链项 / 由链重放得到的责任记录`，整体自哈希后由 genesis 密钥签名。离线侧依次校验：结构 → 自哈希 → genesis 签名 → 是否过期 → 全链重放（序号无间隙、`prev_hash` 相连、每条来源签名、责任语义）→ 重放结果与嵌入记录逐字节一致。
+
+核验回答：某条分桶记录**是否曾由指定来源提交、提交时间、何时被撤回及理由、撤回前后是否发生过纠错**。
+
+### 明确的失败结果
+
+| 情形 | 结果 |
+|---|---|
+| 快照超过 `not_after` | `FAIL: snapshot is EXPIRED`，须取新快照 |
+| 删除/重排链项 | 链序号或 `prev_hash` 断裂，整链校验失败 |
+| 篡改链项或责任记录 | 重放哈希/自哈希不一致 |
+| 伪造来源签名 | 写入时与离线重放均拒绝 |
+| 输入摘要与提交不符 | `digest mismatch` |
+| 指定来源未注册 / 非本人撤回纠错 | `source permission` |
+| 并行写入冲突 | 链顶条件更新（CAS）失败方回滚重试；`--expect-head` 过期则明确冲突 |
+| 旧快照覆盖较新状态 | 导出拒绝（现有快照 head_seq 更新时），同 head 续期 TTL 允许 |
+
+失败信息**不含**被查询的指纹、前缀或摘要（有测试断言）。
+
+### 幂等、可重放与并发
+
+- **重复提交返回原记录**：相同 `claim_id`，或相同 `来源+文件摘要`（撤回/纠错同理用语义键），返回原链项且 `duplicate:true`，不追加、不重复计数；跨进程、中断后重跑同样成立。
+- **从最后链项继续**：`ledger-replay --intents claims.jsonl` 批量追加；已在链上的声明跳过为 duplicate，崩溃后用同一文件重放即从断点继续。
+- **并行写入不分叉**：写事务 `BEGIN IMMEDIATE` 串行化，并以单行 `ledger_head` 的**条件更新**（`WHERE head_seq/head_hash = 所观察的前驱`）做原子 compare-and-set。SQLite WAL 下排队等待写锁的连接可能持有等待前的读快照（即使已拿到写锁）；CAS 影响 0 行即暴露陈旧快照，回滚重试，哈希链因此永不分叉。
+
 ## 测试
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-46 个用例覆盖：并发摄取（同批次/不同批次）、批次去重不重复计数、阈值抑制小桶、阈值变更只经新版本、撤回/误报修正只经新版本生效、激活期间查询不混版、旧版本不可查但可离线验证、导出篡改检测、低于阈值桶检测、存储与 API 面均无原始口令、授权作用域、草稿陈旧检测（新增/撤回/纠错均触发）、无操作写入不误判、冲突后刷新保留版本号与阈值、激活与来源写入并发的先后语义、确认与所审草稿的清单绑定，以及增量包：分桶正确性与双清单绑定、独立检查与基线核对、应用结果与目标全量导出逐字节一致、基线不匹配/载荷篡改/清单篡改/内容缺失均拒绝、切换中与写入清单后中断的前向恢复与回滚、回滚恢复被删桶、暂存后未登记日志即掉电的前向继续与回滚清理（不留孤立暂存区、不误报已回滚）、干净镜像回滚如实报告无可回滚、混入不同增量包被拒、重复应用幂等、全部三个 CLI 入口（含库内 delta-generate）。
+87 个用例覆盖：原有 46 个（摄取/发布/导出/增量，行为不变），以及责任账本：链项哈希与 prev_hash 链接、来源注册与验签、伪造签名与未注册来源拒绝、只能撤回/纠错本人提交、撤回理由与摘要绑定、重复提交/幂等键返回原记录、双撤回幂等、链项删除即断链、存储哈希篡改检测、`--expect-head` 并行冲突、断点重放跳过已追加项、8 线程同声明唯一胜出、不同声明无间隙串行、高并发下链永不分叉（多轮回归）、纠错先于/后于撤回的标记、快照自哈希/genesis 签名/TTL 过期、`--as-of` 时间点截断、责任记录与链项签名篡改检测、缺失链项、genesis 公钥钉扎不符、旧快照不得覆盖较新状态（同 head 可续期）、错误 genesis 密钥拒绝、离线核验的提交/撤回时间/纠错先后判定、仅前缀查询不泄露其他指纹、摘要不符与来源权限的明确失败、失败信息不含桶内容、以及三边界全部经真实子进程（CLI 写入→独立 audit 导出→无数据库 attest 核验，含移走 DB 后仍可核验），并验证账本与现有摄取/构建/激活/导出流水线共存不变。
+
